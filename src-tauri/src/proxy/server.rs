@@ -327,6 +327,22 @@ impl ProxyServer {
             .route("/v1/responses", post(handlers::handle_responses))
             .route("/v1/v1/responses", post(handlers::handle_responses))
             .route("/codex/v1/responses", post(handlers::handle_responses))
+            .route(
+                "/images/generations",
+                post(handlers::handle_image_generations),
+            )
+            .route(
+                "/v1/images/generations",
+                post(handlers::handle_image_generations),
+            )
+            .route(
+                "/v1/v1/images/generations",
+                post(handlers::handle_image_generations),
+            )
+            .route(
+                "/codex/v1/images/generations",
+                post(handlers::handle_image_generations),
+            )
             // Grok Build uses the Responses protocol but has an independent
             // provider namespace and failover queue.
             .route(
@@ -426,6 +442,178 @@ mod tests {
         path_and_query: String,
         authorization: Option<String>,
         body: Value,
+    }
+
+    #[tokio::test]
+    async fn image_generation_routes_preserve_payload_and_response() {
+        let captured = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+        let image_body = r#"{"created":1,"data":[{"b64_json":"aW1hZ2U="}]}"#;
+        let mock_app = Router::new().route(
+            "/v1/images/generations",
+            post({
+                let captured = captured.clone();
+                move |request: axum::extract::Request| {
+                    let captured = captured.clone();
+                    async move {
+                        let (parts, body) = request.into_parts();
+                        let body = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                        let body: Value = serde_json::from_slice(&body).unwrap();
+                        captured.lock().await.push(CapturedRequest {
+                            path_and_query: parts.uri.to_string(),
+                            authorization: parts
+                                .headers
+                                .get(header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                .map(ToString::to_string),
+                            body: body.clone(),
+                        });
+                        if body["prompt"] == "reject" {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                [("content-type", "application/json")],
+                                r#"{"error":{"message":"image request rejected","type":"invalid_request_error"}}"#,
+                            )
+                        } else if body["stream"] == true {
+                            (
+                                StatusCode::OK,
+                                [("content-type", "text/event-stream")],
+                                "event: image_generation.completed\ndata: {\"b64_json\":\"aW1hZ2U=\"}\n\n",
+                            )
+                        } else {
+                            (
+                                StatusCode::OK,
+                                [("content-type", "application/json")],
+                                image_body,
+                            )
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move { axum::serve(listener, mock_app).await.unwrap() });
+        let db = Arc::new(Database::memory().unwrap());
+        let mut provider = Provider::with_id(
+            "image-upstream".into(),
+            "Image Upstream".into(),
+            json!({"base_url": format!("http://{address}/v1"),
+                "auth": {"OPENAI_API_KEY": "image-secret"},
+                "apiFormat": "chat_completions",
+                "env": {"ANTHROPIC_MODEL": "chat-model"}}),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            local_proxy_request_overrides: Some(crate::provider::LocalProxyRequestOverrides {
+                body: Some(json!({"model": "chat-override"})),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        db.save_provider("codex", &provider).unwrap();
+        db.set_current_provider("codex", &provider.id).unwrap();
+        let proxy = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                enable_logging: false,
+                ..ProxyConfig::default()
+            },
+            db.clone(),
+            None,
+        );
+        let info = proxy.start().await.unwrap();
+        let client = reqwest::Client::new();
+        let payload = json!({"model":"gpt-image-2", "prompt":"a cat", "size":"1024x1024", "n":1});
+        for path in [
+            "/images/generations",
+            "/v1/images/generations",
+            "/v1/v1/images/generations",
+            "/codex/v1/images/generations",
+        ] {
+            let response = client
+                .post(format!("http://127.0.0.1:{}{path}?probe=1", info.port))
+                .bearer_auth("client-secret")
+                .json(&payload)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(response.text().await.unwrap(), image_body);
+        }
+        provider.settings_config["base_url"] =
+            json!(format!("http://{address}/v1/responses?api-version=test"));
+        provider.meta.as_mut().unwrap().is_full_url = Some(true);
+        provider.settings_config["config"] = json!(
+            "model_provider = \"xai\"\nmodel = \"grok-4.5\"\n[model_providers.xai]\nbase_url = \"https://api.x.ai/v1\"\nwire_api = \"responses\""
+        );
+        db.save_provider("codex", &provider).unwrap();
+        let mut streaming_payload = payload.clone();
+        streaming_payload["stream"] = json!(true);
+        let response = client
+            .post(format!(
+                "http://127.0.0.1:{}/v1/images/generations?probe=1",
+                info.port
+            ))
+            .json(&streaming_payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .contains("text/event-stream"));
+        assert_eq!(
+            response.text().await.unwrap(),
+            "event: image_generation.completed\ndata: {\"b64_json\":\"aW1hZ2U=\"}\n\n"
+        );
+        let response = client
+            .post(format!(
+                "http://127.0.0.1:{}/v1/images/generations",
+                info.port
+            ))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("{")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let mut rejected_payload = payload.clone();
+        rejected_payload["prompt"] = json!("reject");
+        let response = client
+            .post(format!(
+                "http://127.0.0.1:{}/v1/images/generations",
+                info.port
+            ))
+            .json(&rejected_payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response
+            .text()
+            .await
+            .unwrap()
+            .contains("image request rejected"));
+        proxy.stop().await.unwrap();
+        upstream.abort();
+        let captured = captured.lock().await;
+        assert_eq!(captured.len(), 6);
+        for request in &captured[..4] {
+            assert_eq!(request.path_and_query, "/v1/images/generations?probe=1");
+            assert_eq!(
+                request.authorization.as_deref(),
+                Some("Bearer image-secret")
+            );
+            assert_eq!(request.body, payload);
+        }
+        assert_eq!(
+            captured[4].path_and_query,
+            "/v1/images/generations?api-version=test&probe=1"
+        );
+        assert_eq!(captured[4].body, streaming_payload);
     }
 
     #[tokio::test]

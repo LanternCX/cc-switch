@@ -975,6 +975,21 @@ pub async fn handle_alpha_search(
     State(state): State<ProxyState>,
     request: axum::extract::Request,
 ) -> Result<axum::response::Response, ProxyError> {
+    handle_codex_passthrough(state, request, "/alpha/search").await
+}
+
+pub async fn handle_image_generations(
+    State(state): State<ProxyState>,
+    request: axum::extract::Request,
+) -> Result<axum::response::Response, ProxyError> {
+    handle_codex_passthrough(state, request, "/images/generations").await
+}
+
+async fn handle_codex_passthrough(
+    state: ProxyState,
+    request: axum::extract::Request,
+    canonical_endpoint: &str,
+) -> Result<axum::response::Response, ProxyError> {
     let (parts, req_body) = request.into_parts();
     let method = parts.method.clone();
     let uri = parts.uri;
@@ -991,7 +1006,8 @@ pub async fn handle_alpha_search(
 
     let mut ctx =
         RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
-    let endpoint = endpoint_with_query(&uri, "/alpha/search");
+    let endpoint = endpoint_with_query(&uri, canonical_endpoint);
+    let is_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
@@ -1011,7 +1027,7 @@ pub async fn handle_alpha_search(
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
-            log_forward_error(&state, &ctx, false, &err.error);
+            log_forward_error(&state, &ctx, is_stream, &err.error);
             return build_codex_proxy_error_response(&ctx, &endpoint, &err.error);
         }
     };

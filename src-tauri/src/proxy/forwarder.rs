@@ -1173,6 +1173,8 @@ impl RequestForwarder {
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
         // 使用适配器提取 base_url
         let mut base_url = adapter.extract_base_url(provider)?;
+        let is_image_generation = matches!(app_type, AppType::Codex)
+            && split_endpoint_and_query(endpoint).0 == "/images/generations";
 
         let is_full_url = provider
             .meta
@@ -1245,7 +1247,9 @@ impl RequestForwarder {
         // 应用模型映射（独立于格式转换）
         // Claude Desktop proxy 模式必须先把 Desktop 可见的 claude-* route
         // 映射成真实上游模型名，并且未知 route 要直接报错，不能使用默认模型兜底。
-        let mapped_body = if matches!(app_type, AppType::ClaudeDesktop) {
+        let mapped_body = if is_image_generation {
+            body.clone()
+        } else if matches!(app_type, AppType::ClaudeDesktop) {
             crate::claude_desktop_config::map_proxy_request_model(body.clone(), provider)
                 .map_err(|e| ProxyError::InvalidRequest(e.to_string()))?
         } else {
@@ -1255,7 +1259,11 @@ impl RequestForwarder {
         };
 
         // 与 CCH 对齐：请求前不做 thinking 主动改写（仅保留兼容入口）
-        let mut mapped_body = normalize_thinking_type(mapped_body);
+        let mut mapped_body = if is_image_generation {
+            mapped_body
+        } else {
+            normalize_thinking_type(mapped_body)
+        };
 
         // Grok Build exposes a stable client-side model profile in config.toml.
         // Route requests to the provider's real upstream model before applying
@@ -1264,7 +1272,7 @@ impl RequestForwarder {
             super::providers::apply_codex_upstream_model(provider, &mut mapped_body);
         }
 
-        if is_copilot {
+        if is_copilot && !is_image_generation {
             mapped_body =
                 super::providers::copilot_model_map::apply_copilot_model_normalization(mapped_body);
             self.apply_copilot_live_model_resolution(provider, &mut mapped_body)
@@ -1278,7 +1286,7 @@ impl RequestForwarder {
             // variants pass through unchanged.
             mapped_body =
                 super::model_mapper::strip_one_m_suffix_for_upstream_from_body(mapped_body);
-        } else if !codex_responses_to_anthropic {
+        } else if !codex_responses_to_anthropic && !is_image_generation {
             // Skip on the Codex→Anthropic path: stripping [1m] here would break both the
             // model-catalog match (apply_codex_upstream_model) and the transform's own
             // strip+`context-1m` beta detection. The marker is stripped later, on the
@@ -1294,7 +1302,9 @@ impl RequestForwarder {
         //   1. 先在原始 body 上分类（保留 tool_result 语义，避免误判为 user）
         //   2. 再清洗孤立 tool_result（防止上游 API 报错）
         //   3. 再合并 tool_result + text（减少 premium 计费）
-        let copilot_optimization = if is_copilot && self.copilot_optimizer_config.enabled {
+        let optimize_copilot =
+            is_copilot && !is_image_generation && self.copilot_optimizer_config.enabled;
+        let copilot_optimization = if optimize_copilot {
             // 1. 在原始 body 上分类 — 必须在清洗/合并之前执行
             //    孤立 tool_result 仍保持 tool_result 类型，分类能正确识别为 agent
             let has_anthropic_beta = headers.contains_key("anthropic-beta");
@@ -1490,8 +1500,12 @@ impl RequestForwarder {
                 &effective_endpoint,
                 is_full_url,
             )
-        } else if is_full_url && is_codex_alpha_search {
-            rewrite_codex_alpha_search_full_url(&base_url, passthrough_query.as_deref())?
+        } else if is_full_url && (is_codex_alpha_search || is_image_generation) {
+            rewrite_codex_sibling_full_url(
+                &base_url,
+                split_endpoint_and_query(&effective_endpoint).0,
+                passthrough_query.as_deref(),
+            )?
         } else if is_full_url
             || codex_chat_base_is_full_endpoint
             || codex_anthropic_base_is_full_endpoint
@@ -1626,6 +1640,7 @@ impl RequestForwarder {
         // scattered across sanitizers. Flatten namespaces first; then apply
         // xAI request rewrites (schema, agent_message, unknown models).
         if matches!(app_type, AppType::Codex | AppType::GrokBuild)
+            && !is_image_generation
             && !codex_responses_to_chat
             && !codex_responses_to_anthropic
             && super::providers::provider_needs_responses_namespace_flatten(provider)
@@ -1667,14 +1682,14 @@ impl RequestForwarder {
             }
         }
 
-        if matches!(app_type, AppType::Codex | AppType::GrokBuild) {
+        if matches!(app_type, AppType::Codex | AppType::GrokBuild) && !is_image_generation {
             self.apply_media_prevention(&mut request_body, provider);
         }
 
         // 过滤私有参数（以 `_` 开头的字段），防止内部信息泄露到上游
         // 默认使用空白名单，过滤所有 _ 前缀字段
         let mut filtered_body = prepare_upstream_request_body(request_body);
-        if !is_copilot {
+        if !is_copilot && !is_image_generation {
             if let Some(overrides) = provider
                 .meta
                 .as_ref()
@@ -3305,24 +3320,16 @@ fn append_query_to_full_url(base_url: &str, query: Option<&str>) -> String {
     }
 }
 
-/// Derive the standalone Alpha Search endpoint from a Codex provider configured
-/// with a complete Responses URL.
-///
-/// Full-URL mode normally means "use this exact URL". That is correct for the
-/// request type it was configured for, but reusing a `/responses` URL for an
-/// Alpha Search request silently posts the search payload to the wrong API. Only
-/// rewrite URL shapes whose sibling endpoint is unambiguous; opaque full URLs
-/// fail closed with a configuration error instead of leaking the search payload
-/// to an unrelated route.
-fn rewrite_codex_alpha_search_full_url(
+/// Derive standalone Codex endpoints from a full Responses URL. Reject opaque
+/// URLs because their sibling endpoints cannot be inferred safely.
+fn rewrite_codex_sibling_full_url(
     base_url: &str,
+    endpoint: &str,
     request_query: Option<&str>,
 ) -> Result<String, ProxyError> {
     let trimmed = base_url.trim();
     let parsed = url::Url::parse(trimmed).map_err(|_| {
-        ProxyError::ConfigError(
-            "Codex Alpha Search requires a valid full Responses URL".to_string(),
-        )
+        ProxyError::ConfigError("Codex requires a valid full Responses URL".to_string())
     })?;
 
     // Fragments are never sent in HTTP requests. Drop one before splitting the
@@ -3338,13 +3345,15 @@ fn rewrite_codex_alpha_search_full_url(
     let url_without_query = url_without_query.trim_end_matches('/');
 
     let parsed_path = parsed.path().trim_end_matches('/').to_string();
-    let suffix = if parsed_path.ends_with("/responses/compact") {
+    let suffix = if parsed_path.ends_with(endpoint) {
+        endpoint
+    } else if parsed_path.ends_with("/responses/compact") {
         "/responses/compact"
     } else if parsed_path.ends_with("/responses") {
         "/responses"
     } else {
         return Err(ProxyError::ConfigError(
-            "Codex Alpha Search cannot derive /alpha/search from an opaque full URL; use a base URL or a full URL ending in /responses".to_string(),
+            format!("Codex cannot derive {endpoint} from an opaque full URL; use a base URL or a full URL ending in /responses"),
         ));
     };
 
@@ -3352,7 +3361,7 @@ fn rewrite_codex_alpha_search_full_url(
         .len()
         .checked_sub(suffix.len())
         .ok_or_else(|| ProxyError::ConfigError("Invalid Codex full URL".to_string()))?;
-    let mut rewritten = format!("{}/alpha/search", &url_without_query[..prefix_len]);
+    let mut rewritten = format!("{}{endpoint}", &url_without_query[..prefix_len]);
 
     let request_query = request_query.filter(|query| !query.is_empty());
     let base_query = base_query.filter(|query| !query.is_empty());
@@ -4771,8 +4780,12 @@ mod tests {
 
         for (base_url, expected) in cases {
             assert_eq!(
-                rewrite_codex_alpha_search_full_url(base_url, Some("client_version=0.144.6"))
-                    .expect("known Responses full URL should be rewritable"),
+                rewrite_codex_sibling_full_url(
+                    base_url,
+                    "/alpha/search",
+                    Some("client_version=0.144.6")
+                )
+                .expect("known Responses full URL should be rewritable"),
                 expected
             );
         }
@@ -4780,8 +4793,9 @@ mod tests {
 
     #[test]
     fn alpha_search_rejects_opaque_full_url_instead_of_misrouting_payload() {
-        let error = rewrite_codex_alpha_search_full_url(
+        let error = rewrite_codex_sibling_full_url(
             "https://relay.example/custom/rpc-endpoint",
+            "/alpha/search",
             Some("client_version=0.144.6"),
         )
         .expect_err("opaque endpoint must fail closed");
@@ -4790,6 +4804,26 @@ mod tests {
             error,
             ProxyError::ConfigError(message)
                 if message.contains("cannot derive /alpha/search")
+        ));
+    }
+
+    #[test]
+    fn image_generation_resolves_full_urls_without_losing_prefix_or_query() {
+        for suffix in ["/responses", "/responses/compact/", "/images/generations"] {
+            let base = format!("https://relay.example/custom/%2F/v1{suffix}?version=1#fragment");
+            assert_eq!(
+                rewrite_codex_sibling_full_url(&base, "/images/generations", Some("probe=1"))
+                    .unwrap(),
+                "https://relay.example/custom/%2F/v1/images/generations?version=1&probe=1"
+            );
+        }
+        assert!(matches!(
+            rewrite_codex_sibling_full_url(
+                "https://relay.example/custom/rpc",
+                "/images/generations",
+                None
+            ),
+            Err(ProxyError::ConfigError(_))
         ));
     }
 
